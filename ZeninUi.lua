@@ -120,6 +120,7 @@ end
 -- Runs fn on a thread owned by the maid: cancelled if the maid is cleaned first, and dropped
 -- from the maid once it finishes, so repeated spawns don't pile up.
 local function Owned(self, start, fn, ...)
+	if self._dead then return nil end
 	local done, thread = false, nil
 	thread = start(function(...)
 		local ok, err = pcall(fn, ...)
@@ -193,9 +194,11 @@ function Maid:Clean()
 	if self._cleaning then return end
 	self._cleaning = true
 	local named = self._named
-	for k, t in pairs(named) do
+	local k, job = next(named)
+	while k ~= nil do
 		named[k] = nil
-		Maid.CleanTask(t)
+		Maid.CleanTask(job)
+		k, job = next(named)
 	end
 	local tasks = self._tasks
 	while #tasks > 0 do
@@ -459,6 +462,14 @@ local TEXT = 11
 local TI_FAST = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local SCALE_OPTIONS = {"1.0x", "1.5x", "2.0x", "2.5x"}
 local SCALE_MAP = {["1.0x"] = 0.8, ["1.5x"] = 0.9, ["2.0x"] = 0.95, ["2.5x"] = 1}
+local function ScaleLabelFor(scale)
+	local best, bestDiff = SCALE_OPTIONS[#SCALE_OPTIONS], math.huge
+	for _, name in ipairs(SCALE_OPTIONS) do
+		local diff = math.abs(SCALE_MAP[name] - (tonumber(scale) or 1))
+		if diff < bestDiff then best, bestDiff = name, diff end
+	end
+	return best
+end
 local DETAIL_MODES = {"Time", "FPS", "Ping", "Product Type"}
 local DETAIL_ICONS = {Time = "clock", FPS = "activity", Ping = "wifi", ["Product Type"] = "monitor"}
 local WHITE = Color3.new(1, 1, 1)
@@ -577,10 +588,10 @@ local function Tween(obj, info, props)
 end
 
 local HOVER_TI = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-local EL_TI = TweenInfo.new(0.14, Enum.EasingStyle.Quad)
 local MOVE_TI = TweenInfo.new(0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 local POP_IN = TweenInfo.new(0.16, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 local POP_OUT = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+local POP_SIZE = TweenInfo.new(0.18, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 
 -- Instant set that cancels only the running tweens touching these properties (their other
 -- targets are applied immediately), so theme repaints never get overwritten by stale tweens.
@@ -666,7 +677,12 @@ end
 
 local function Decimals(step)
 	local s = tostring(step)
-	if s:find("e") then return 4 end
+	if s:find("e") then
+		local mantissa, exp = s:match("^([%d%.]+)e%-(%d+)$")
+		if not exp then return 0 end
+		local dot = mantissa:find("%.")
+		return math.min(tonumber(exp) + (dot and #mantissa - dot or 0), 15)
+	end
 	local d = s:find("%.")
 	return d and (#s - d) or 0
 end
@@ -711,7 +727,6 @@ local function ToAlpha(a)
 	if not a or a ~= a then return nil end
 	return math.clamp(a, 0, 1)
 end
-
 
 local function MakeDraggable(W, handle, target, opts)
 	opts = opts or {}
@@ -783,6 +798,7 @@ local function NormalizeLogo(spec, title)
 		if #spec <= 2 then return {Text = spec} end
 		return {Icon = spec}
 	end
+	if type(spec) ~= "table" then return NormalizeLogo(nil, title) end
 	return spec
 end
 
@@ -841,12 +857,14 @@ local function NewElement(W, S, kind, o, height)
 		Enabled = o.Enabled ~= false and o.Disabled ~= true,
 		Visible = o.Visible ~= false,
 		Row = row,
+		Maid = W.Maid:Child(),
+		_deps = {},
+		_depOn = {},
 	}
 	row.Visible = el.Visible
 	local listeners = {}
-	el._apply = function() end
+	el._apply = function(_animate) end
 
-	el._deps = {}
 	function el._sync(value)
 		if el.Flag then Library.Flags[el.Flag] = value end
 		for _, fn in ipairs(el._deps) do SafeCall(fn, value) end
@@ -875,6 +893,8 @@ local function NewElement(W, S, kind, o, height)
 	end)
 	Method(el, "IsVisible", function() return el.Visible end)
 	Method(el, "DependsOn", function(other, invert)
+		if type(other) == "string" then other = Library.Options[other] end
+		if type(other) ~= "table" or not other._deps then return el end
 		local function Upd(v)
 			if type(v) == "table" then
 				v = next(v) ~= nil
@@ -885,31 +905,29 @@ local function NewElement(W, S, kind, o, height)
 			el.SetEnabled(v)
 		end
 		table.insert(other._deps, Upd)
-		el._depOn = el._depOn or {}
 		table.insert(el._depOn, {other, Upd})
 		Upd(other.Get())
 		return el
 	end)
 	Method(el, "Destroy", function()
 		W.ClosePopupOf(el)
-		if el.Flag then
+		if el.Flag and Library.Options[el.Flag] == el then
 			Library.Flags[el.Flag] = nil
 			Library.Options[el.Flag] = nil
 		end
 		local i = IndexOf(W.Elements, el)
 		if i then table.remove(W.Elements, i) end
-		for _, link in ipairs(el._depOn or {}) do
+		for _, link in ipairs(el._depOn) do
 			local j = IndexOf(link[1]._deps, link[2])
 			if j then table.remove(link[1]._deps, j) end
 		end
-		el._depOn = nil
+		table.clear(el._depOn)
 		table.clear(el._deps)
 		el.Maid:Destroy()
 		row:Destroy()
 		W.Prune()
 	end)
 
-	el.Maid = W.Maid:Child()
 	Method(el, "GiveTask", function(job) return el.Maid:Give(job) end)
 	if el.Flag then Library.Options[el.Flag] = el end
 	table.insert(W.Elements, el)
@@ -1030,6 +1048,10 @@ local function AttachSettings(W, el, place)
 		end
 		BuildLogo()
 		table.insert(W.LogoHooks, BuildLogo)
+		el.Maid:Give(function()
+			local i = IndexOf(W.LogoHooks, BuildLogo)
+			if i then table.remove(W.LogoHooks, i) end
+		end)
 		local title = Label(brand, so.Title or so.Name or ((el.Name or "Element") .. " Settings"), {AutoX = true, Size = UDim2.new(0, 0, 1, 0), Weight = "SemiBold"})
 		title.LayoutOrder = 2
 		W.Paint(title, "TextColor3", "Text")
@@ -1043,7 +1065,7 @@ local function AttachSettings(W, el, place)
 			return 35 + h + 10
 		end
 		layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-			if open then frame.Size = UDim2.fromOffset(PANEL_W, Height()) end
+			if open then SetProps(frame, {Size = UDim2.fromOffset(PANEL_W, Height())}) end
 		end)
 
 		local P = {Order = 0, Content = content, Frame = frame}
@@ -1061,7 +1083,7 @@ local function AttachSettings(W, el, place)
 			end})
 			open = true
 			PaintGear(true)
-			Tween(frame, TweenInfo.new(0.18, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {Size = UDim2.fromOffset(PANEL_W, Height())})
+			Tween(frame, POP_SIZE, {Size = UDim2.fromOffset(PANEL_W, Height())})
 		end)
 		Method(P, "Close", function() W.ClosePopupOf(owner) end)
 		Method(P, "IsOpen", function() return open end)
@@ -1170,7 +1192,7 @@ local function OpenList(W, owner, btn, options, isSelected, onPick, multi, onClo
 		for _, x in ipairs(items) do Paint(x) end
 	end, popup)
 	W.PushPopup(popup, owner, {OnClose = onClose})
-	Tween(popup, TweenInfo.new(0.18, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {Size = UDim2.fromOffset(w, totalH)})
+	Tween(popup, POP_SIZE, {Size = UDim2.fromOffset(w, totalH)})
 end
 
 local function AddToggle(W, S, o)
@@ -1397,16 +1419,22 @@ local function AddDropdown(W, S, o, multi)
 	local selected = {}
 	el.MaxVisible = o.MaxVisible or 8
 
-	if multi then
-		local def = o.Default or o.Value or {}
-		if type(def) ~= "table" then def = {def} end
-		for k, v in pairs(def) do
+	-- Accepts {a, b} lists, {a = true} maps, or a single scalar.
+	local function ParseSelection(src)
+		local out = {}
+		if type(src) ~= "table" then src = {src} end
+		for k, v in pairs(src) do
 			if type(k) == "number" then
-				selected[v] = true
+				out[v] = true
 			elseif v then
-				selected[k] = true
+				out[k] = true
 			end
 		end
+		return out
+	end
+
+	if multi then
+		selected = ParseSelection(o.Default or o.Value or {})
 	else
 		value = o.Default or o.Value
 		if value == nil and not o.AllowNone then value = options[1] end
@@ -1516,26 +1544,10 @@ local function AddDropdown(W, S, o, multi)
 			for i, v in ipairs(List()) do names[i] = tostring(v) end
 			return table.concat(names, "\0")
 		end
-		return tostring(value)
+		return value == nil and "\0" or tostring(value)
 	end
-
-	Method(el, "Set", function(v, silent)
-		local before = Key()
-		if multi then
-			selected = {}
-			if type(v) ~= "table" then v = {v} end
-			for k, x in pairs(v) do
-				if type(k) == "number" then
-					selected[x] = true
-				elseif x then
-					selected[k] = true
-				end
-			end
-		else
-			if v == nil and not o.AllowNone then return end
-			if v ~= nil and not IndexOf(options, v) then return end
-			value = v
-		end
+	-- Closes any open list so it can't show stale selection state, then publishes the change.
+	local function Commit(before, silent)
 		W.ClosePopupOf(el)
 		Sync()
 		if Key() ~= before and not silent then
@@ -1543,6 +1555,18 @@ local function AddDropdown(W, S, o, multi)
 		else
 			el._sync(el.Value)
 		end
+	end
+
+	Method(el, "Set", function(v, silent)
+		local before = Key()
+		if multi then
+			selected = ParseSelection(v)
+		else
+			if v == nil and not o.AllowNone then return end
+			if v ~= nil and not IndexOf(options, v) then return end
+			value = v
+		end
+		Commit(before, silent)
 	end)
 	Method(el, "Get", function()
 		if multi then return List() end
@@ -1553,7 +1577,6 @@ local function AddDropdown(W, S, o, multi)
 	Method(el, "SetOptions", function(list, silent)
 		local before = Key()
 		options = CopyList(list)
-		W.ClosePopupOf(el)
 		if multi then
 			for k in pairs(selected) do
 				if not IndexOf(options, k) then selected[k] = nil end
@@ -1563,46 +1586,41 @@ local function AddDropdown(W, S, o, multi)
 		elseif value == nil and not o.AllowNone then
 			value = options[1]
 		end
-		Sync()
-		if Key() ~= before and not silent then
-			Fire()
-		else
-			el._sync(el.Value)
-		end
+		Commit(before, silent)
 	end)
 	el.Refresh = el.SetOptions
-	Method(el, "AddOption", function(opt)
+	Method(el, "AddOption", function(opt, silent)
 		if IndexOf(options, opt) then return end
 		local list = CopyList(options)
 		table.insert(list, opt)
-		el.SetOptions(list)
+		el.SetOptions(list, silent)
 	end)
-	Method(el, "RemoveOption", function(opt)
+	Method(el, "RemoveOption", function(opt, silent)
 		local i = IndexOf(options, opt)
 		if not i then return end
 		local list = CopyList(options)
 		table.remove(list, i)
-		el.SetOptions(list)
+		el.SetOptions(list, silent)
 	end)
 	if multi then
 		Method(el, "IsSelected", function(opt) return selected[opt] == true end)
-		Method(el, "Select", function(opt)
+		Method(el, "Select", function(opt, silent)
 			if not IndexOf(options, opt) or selected[opt] then return end
+			local before = Key()
 			selected[opt] = true
-			Sync()
-			Fire()
+			Commit(before, silent)
 		end)
-		Method(el, "Deselect", function(opt)
+		Method(el, "Deselect", function(opt, silent)
 			if not selected[opt] then return end
+			local before = Key()
 			selected[opt] = nil
-			Sync()
-			Fire()
+			Commit(before, silent)
 		end)
-		Method(el, "ToggleOption", function(opt)
-			if selected[opt] then el.Deselect(opt) else el.Select(opt) end
+		Method(el, "ToggleOption", function(opt, silent)
+			if selected[opt] then el.Deselect(opt, silent) else el.Select(opt, silent) end
 		end)
-		Method(el, "Clear", function() el.Set({}) end)
-		Method(el, "SelectAll", function() el.Set(CopyList(options)) end)
+		Method(el, "Clear", function(silent) el.Set({}, silent) end)
+		Method(el, "SelectAll", function(silent) el.Set(CopyList(options), silent) end)
 	end
 	AttachSettings(W, el, function()
 		btn.Size = UDim2.new(0.5, -29, 0, 25)
@@ -1615,7 +1633,7 @@ end
 local function AddCardButton(W, S, o)
 	o = Opts(o)
 	local cb = o.Callback
-	local el, row = NewElement(W, S, "Button", {Enabled = o.Enabled, Disabled = o.Disabled, Visible = o.Visible}, 40)
+	local el, row = NewElement(W, S, "Button", {Name = o.Name or o.Title, Enabled = o.Enabled, Disabled = o.Disabled, Visible = o.Visible}, 40)
 	local title = o.Name or o.Title or "Button"
 	local desc = o.Description or o.Desc
 	local buttonText = o.ButtonText or o.Text or "Open"
@@ -2009,13 +2027,18 @@ local function AddColorPicker(W, S, o)
 	end
 	W.Bind(function() el._apply() end, row)
 
-	local function Changed(silent)
+	local function Snapshot()
+		local parts = {}
+		for i = 1, n do parts[i] = ToHex(colors[i]) .. ":" .. alphas[i] end
+		return table.concat(parts, "|")
+	end
+	local function Commit(before, silent)
 		el.Value = Value()
 		el._apply()
-		if silent then
-			el._sync(el.Value)
-		else
+		if before ~= Snapshot() and not silent then
 			el._fire(el.Value, AlphaValue())
+		else
+			el._sync(el.Value)
 		end
 	end
 
@@ -2024,13 +2047,15 @@ local function AddColorPicker(W, S, o)
 			if not el.Enabled or not W.PreparePopup(c, c.btn) then return end
 			OpenColorModal(W, c, c.btn, colors[i], alphas[i], function(col, a)
 				if not el.Enabled then return end
+				local before = Snapshot()
 				colors[i], alphas[i] = col, a
-				Changed(false)
+				Commit(before)
 			end, c)
 		end)
 	end
 
 	Method(el, "Set", function(v, a, silent)
+		local before = Snapshot()
 		if type(v) ~= "table" then v = {v} end
 		for i = 1, n do
 			local col = ToColor(v[i])
@@ -2040,16 +2065,17 @@ local function AddColorPicker(W, S, o)
 			if ToAlpha(ai) then alphas[i] = ToAlpha(ai) end
 		end
 		W.ClosePopupOf(el)
-		Changed(silent)
+		Commit(before, silent)
 	end)
 	Method(el, "SetColor", function(i, col, a, silent)
 		i = tonumber(i) or 1
 		if not colors[i] then return end
+		local before = Snapshot()
 		col = ToColor(col)
 		if col then colors[i] = col end
 		if ToAlpha(a) then alphas[i] = ToAlpha(a) end
 		W.ClosePopupOf(circles[i])
-		Changed(silent)
+		Commit(before, silent)
 	end)
 	Method(el, "Get", Value)
 	Method(el, "GetColor", function(i) return colors[i or 1] end)
@@ -2089,7 +2115,7 @@ end
 local function AddPlainButton(W, S, o)
 	o = Opts(o)
 	local cb = o.Callback
-	local el, row = NewElement(W, S, "Button", {Enabled = o.Enabled, Disabled = o.Disabled, Visible = o.Visible}, 27)
+	local el, row = NewElement(W, S, "Button", {Name = o.Name or o.Title or o.Text, Enabled = o.Enabled, Disabled = o.Disabled, Visible = o.Visible}, 27)
 	local text = tostring(o.Name or o.Title or o.Text or "Button")
 	local b = Create("TextButton", {
 		Size = UDim2.fromScale(1, 1),
@@ -2319,6 +2345,7 @@ end
 -- Byte offsets of every character boundary (0 .. #text).
 local function Boundaries(text)
 	local out = {0}
+	if text == "" then return out end
 	local ok = pcall(function()
 		for p in utf8.codes(text) do
 			if p > 1 then table.insert(out, p - 1) end
@@ -2334,7 +2361,7 @@ local function Boundaries(text)
 end
 
 local function ReadClipboard()
-	local f = Library.GetClipboard or getclipboard or fromclipboard or (Clipboard and Clipboard.get)
+	local f = getclipboard or fromclipboard or (Clipboard and Clipboard.get)
 	if type(f) ~= "function" then return nil end
 	local ok, r = pcall(f)
 	if ok and type(r) == "string" and r ~= "" then return r end
@@ -2442,8 +2469,10 @@ for name, spec in pairs(VKB_LAYOUTS) do VKB_LAYOUTS[name] = NormLayout(spec) end
 
 function VKB.CurrentLayout()
 	local name = VKB.LayoutName or VKB.Cfg.Layout or "Default"
-	local lay = VKB_LAYOUTS[name] or VKB_LAYOUTS.Default
-	if lay ~= VKB_LAYOUTS[name] then VKB.LayoutName = "Default" end
+	local lay = VKB_LAYOUTS[name]
+	if not lay then
+		lay, VKB.LayoutName = VKB_LAYOUTS.Default, "Default"
+	end
 	return lay
 end
 
@@ -2620,7 +2649,7 @@ function VKB.Layout()
 		-- through the padding/gap, hence the solved form).
 		local uMax = aspect * w / math.max(0.1, cols + aspect * (2 * padU - gapU))
 		local hMax = uMax * hUnits
-		if tonumber(C.MaxAspect) then hMax = math.min(hMax, w * C.MaxAspect) end
+		if tonumber(C.MaxAspect) then hMax = math.min(hMax, w * tonumber(C.MaxAspect)) end
 		h = math.min(vp.Y * (tonumber(lay.Height) or tonumber(C.Height) or 0.56), hMax) * mult
 		h = math.floor(math.clamp(h, math.min(tonumber(C.MinHeight) or 190, vp.Y * 0.85), vp.Y * 0.85))
 		local ax = C.Align == "Left" and 0 or (C.Align == "Right" and 1 or 0.5)
@@ -2781,7 +2810,7 @@ function VKB.Paint()
 	VKB.GripIcon.ImageColor3 = Col("Grip", T.NavGray)
 	VKB.Field.BackgroundColor3 = Col("Field", T.DropdownBg)
 	VKB.FieldStroke.Color = Col("FieldStroke", accent)
-	VKB.FieldStroke.Transparency = VKB.Cfg.Colors.FieldStroke and 0 or (1 - alpha)
+	VKB.FieldStroke.Transparency = Col("FieldStroke") and 0 or (1 - alpha)
 	VKB.Preview.TextColor3 = Col("Text", T.Text)
 	VKB.Caret.BackgroundColor3 = Col("Caret", accent)
 	for _, k in ipairs(VKB.Keys) do VKB.PaintKey(k) end
@@ -2984,6 +3013,7 @@ function VKB.Move(dir)
 	if not VKB.Target then return end
 	local text, cur = VKB.Text, VKB.Cursor
 	local a, b = Selection()
+	VKB.LastKind = nil
 	if not VKB.SelectMode and a and (dir == -1 or dir == 1) then
 		VKB.SetText(text, dir < 0 and a or b, nil)
 		return
@@ -3113,6 +3143,7 @@ function VKB.FieldDown(input)
 	local now = os.clock()
 	local last = VKB.LastTap
 	VKB.LastTap = {t = now, idx = idx}
+	VKB.LastKind = nil
 	if VKB.Cfg.DoubleTapSelect ~= false and last and now - last.t < 0.35 and math.abs(last.idx - idx) <= 2 and VKB.Text ~= "" then
 		local text = VKB.Text
 		local a = WordLeft(text, idx)
@@ -3280,10 +3311,10 @@ function VKB.Open(box, opts)
 	opts = opts or {}
 	if typeof(box) ~= "Instance" or not box:IsA("TextBox") then return false end
 	if VKB.Target == box then return true end
-	if VKB.Target then VKB.Close(false, true) end
-	VKB.Build()
 	local sg = box:FindFirstAncestorWhichIsA("ScreenGui")
 	if not sg then return false end
+	if VKB.Target then VKB.Close(false, true) end
+	VKB.Build()
 	if VKB.Gui.Parent ~= sg.Parent then
 		VKB.Purge(sg.Parent)
 		VKB.Gui.Parent = sg.Parent
@@ -3315,6 +3346,13 @@ function VKB.Open(box, opts)
 			VKB.Close(false)
 			return
 		end
+		if b and b.Text ~= VKB.Text then
+			VKB.Text = b.Text
+			VKB.Cursor = math.min(VKB.Cursor, #VKB.Text)
+			VKB.Anchor = VKB.Anchor and math.min(VKB.Anchor, #VKB.Text) or nil
+			VKB.LastKind = nil
+			VKB.Render()
+		end
 		-- Solid while typing, then a calm blink.
 		VKB.Caret.Visible = ((os.clock() - (VKB.LastEdit or 0)) % 1.1) < 0.6
 	end)
@@ -3335,7 +3373,9 @@ function VKB.Destroy()
 	if VKB.Target then VKB.Close(false, true) end
 	if VKB.Tracker then VKB.Tracker:Disconnect() VKB.Tracker = nil end
 	if VKB.Gui then pcall(function() VKB.Gui:Destroy() end) end
-	VKB.Gui, VKB.Root, VKB.Panel, VKB.Keys, VKB.Shown, VKB.Drag, VKB.FieldDrag = nil, nil, nil, nil, nil, nil, nil
+	VKB.Gui, VKB.Root, VKB.Scaler, VKB.Panel, VKB.PanelCorner, VKB.Stroke = nil, nil, nil, nil, nil, nil
+	VKB.Grip, VKB.GripIcon, VKB.Field, VKB.FieldStroke, VKB.Preview, VKB.Measure, VKB.Caret = nil, nil, nil, nil, nil, nil, nil
+	VKB.Keys, VKB.Shown, VKB.Drag, VKB.FieldDrag, VKB.Target = nil, nil, nil, nil, nil
 	VKB.HeaderKeys, VKB.ToolKeys, VKB.RowKeys = nil, nil, nil
 	VKB.Held = {}
 end
@@ -3357,8 +3397,8 @@ end
 
 function VKB.RefreshCovers()
 	local on = UseVKeyboard()
-	for cover, native in pairs(VKB.Covers) do
-		if cover.Parent then cover.Visible = on and not native end
+	for cover in pairs(VKB.Covers) do
+		if cover.Parent then cover.Visible = on end
 	end
 	if not on and VKB.Target then VKB.Close(false) end
 end
@@ -3382,15 +3422,6 @@ local function AttachKeyboard(box, themeSrc, onFocus, onBlur, extra)
 	local opts = {theme = themeSrc, onFocus = onFocus, onBlur = onBlur, onEnter = extra.OnEnter, Layout = extra.Layout}
 	if onFocus then box.Focused:Connect(onFocus) end
 	if onBlur then box.FocusLost:Connect(function(enter) onBlur(enter) end) end
-	local cover = Create("TextButton", {
-		Size = UDim2.fromScale(1, 1),
-		BackgroundTransparency = 1,
-		Text = "",
-		ZIndex = box.ZIndex + 1,
-		Visible = not native and UseVKeyboard(),
-		Parent = box,
-	})
-	VKB.Covers[cover] = native
 	local function Focus()
 		if not box.TextEditable then return end
 		if not native and UseVKeyboard() then
@@ -3401,7 +3432,18 @@ local function AttachKeyboard(box, themeSrc, onFocus, onBlur, extra)
 			box:CaptureFocus()
 		end
 	end
-	cover.Activated:Connect(Focus)
+	if not native then
+		local cover = Create("TextButton", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Text = "",
+			ZIndex = box.ZIndex + 1,
+			Visible = UseVKeyboard(),
+			Parent = box,
+		})
+		VKB.Covers[cover] = true
+		cover.Activated:Connect(Focus)
+	end
 	return Focus
 end
 
@@ -3409,9 +3451,9 @@ end
 local Keyboard = {}
 Library.Keyboard = Keyboard
 
-local function CfgCopy()
+local function CopyCfg(src)
 	local out = {}
-	for k, v in pairs(VKB.Cfg) do
+	for k, v in pairs(src) do
 		if type(v) == "table" then
 			local t = {}
 			for a, b in pairs(v) do t[a] = b end
@@ -3422,6 +3464,7 @@ local function CfgCopy()
 	end
 	return out
 end
+local function CfgCopy() return CopyCfg(VKB.Cfg) end
 local function Refresh()
 	if not VKB.Root then return end
 	VKB.BuildKeys()
@@ -3438,8 +3481,9 @@ Method(Keyboard, "Configure", function(opts)
 				for name, c in pairs(v) do VKB.Cfg.Colors[name] = c end
 			end
 		elseif k == "Mode" or k == "Enabled" then
-			VKB.Cfg.Mode = NormMode(k == "Enabled" and (v == true and "Auto" or v) or v)
+			VKB.Cfg.Mode = NormMode(k == "Enabled" and v == true and "Auto" or v)
 		elseif k == "Compact" then
+			VKB.Cfg.Compact = v == true
 			VKB.SetCompact(v == true)
 		elseif k == "Layout" then
 			VKB.Cfg.Layout = VKB_LAYOUTS[v] and v or "Default"
@@ -3457,16 +3501,7 @@ Method(Keyboard, "Configure", function(opts)
 end)
 Method(Keyboard, "Get", CfgCopy)
 Method(Keyboard, "Reset", function()
-	VKB.Cfg = {Colors = {}}
-	for k, v in pairs(KB_DEFAULTS) do
-		if type(v) == "table" then
-			local t = {}
-			for a, b in pairs(v) do t[a] = b end
-			VKB.Cfg[k] = t
-		else
-			VKB.Cfg[k] = v
-		end
-	end
+	VKB.Cfg = CopyCfg(KB_DEFAULTS)
 	VKB.SetCompact(false)
 	Refresh()
 	VKB.RefreshCovers()
@@ -3638,11 +3673,13 @@ local function AddInput(W, S, o)
 	end
 
 	local updating = false
-	local function Commit(text, silent)
+	local function Commit(text, silent, keepText)
 		text = Sanitize(text)
-		updating = true
-		box.Text = text
-		updating = false
+		if not keepText then
+			updating = true
+			box.Text = text
+			updating = false
+		end
 		local changed = text ~= value
 		value = text
 		el.Value = Out()
@@ -3690,7 +3727,7 @@ local function AddInput(W, S, o)
 			box.Text = box.Text:sub(1, maxLen)
 			updating = false
 		end
-		if live and el.Enabled then Commit(box.Text) end
+		if live and el.Enabled then Commit(box.Text, false, true) end
 	end)
 
 	Method(el, "Set", function(v, silent) Commit(v, silent) end)
@@ -3911,10 +3948,9 @@ local function BuildKeybindList(W, cfg)
 
 	-- Rows grow/shrink in height; the panel auto-sizes, so the whole list resizes smoothly.
 	local function ShowRow(r, show, animate, h)
-		local key = r
 		L.RowTok = L.RowTok or setmetatable({}, {__mode = "k"})
-		L.RowTok[key] = (L.RowTok[key] or 0) + 1
-		local tok = L.RowTok[key]
+		local tok = (L.RowTok[r] or 0) + 1
+		L.RowTok[r] = tok
 		local target = UDim2.new(1, 0, 0, show and h or 0)
 		if not animate then
 			SetProps(r, {Size = target})
@@ -3925,7 +3961,7 @@ local function BuildKeybindList(W, cfg)
 		local t = Tween(r, ROW_TI, {Size = target})
 		if not show then
 			t.Completed:Connect(function()
-				if L.RowTok[key] == tok and r.Parent then r.Visible = false end
+				if L.RowTok[r] == tok and r.Parent then r.Visible = false end
 			end)
 		end
 	end
@@ -4105,10 +4141,19 @@ local function BuildKeybindList(W, cfg)
 	end
 
 	local api = {}
-	Method(api, "SetVisible", function(b) L.Wanted = b ~= false L.Refresh() end)
+	-- The settings page mirrors these two; keep its toggles in step without re-firing them.
+	Method(api, "SetVisible", function(b)
+		L.Wanted = b ~= false
+		L.Refresh()
+		if W.KbListToggle and W.KbListToggle.Get() ~= L.Wanted then W.KbListToggle.Set(L.Wanted, true) end
+	end)
 	Method(api, "IsVisible", function() return L.Wanted end)
 	Method(api, "Toggle", function() api.SetVisible(not L.Wanted) end)
-	Method(api, "SetShowInactive", function(b) L.ShowInactive = b ~= false L.Refresh() end)
+	Method(api, "SetShowInactive", function(b)
+		L.ShowInactive = b ~= false
+		L.Refresh()
+		if W.KbInactiveToggle and W.KbInactiveToggle.Get() ~= L.ShowInactive then W.KbInactiveToggle.Set(L.ShowInactive, true) end
+	end)
 	Method(api, "SetCollapsed", function(b) L.Collapsed = b == true L.Refresh() end)
 	Method(api, "IsCollapsed", function() return L.Collapsed end)
 	Method(api, "SetTitle", function(t) title.Text = tostring(t) end)
@@ -4132,7 +4177,7 @@ local function AddKeybind(W, S, o)
 	local mode = tostring(o.Mode or "Toggle")
 	if mode ~= "Hold" and mode ~= "Press" then mode = "Toggle" end
 	-- Toggle and Hold both report on/off, so users may switch between them; Press stays Press.
-	local modes = type(o.Modes) == "table" and o.Modes or (mode == "Press" and {"Press"} or {"Toggle", "Hold"})
+	local modes = type(o.Modes) == "table" and CopyList(o.Modes) or (mode == "Press" and {"Press"} or {"Toggle", "Hold"})
 	local function ModeAllowed(m) return IndexOf(modes, m) ~= nil end
 	if not ModeAllowed(mode) then table.insert(modes, 1, mode) end
 	local showModeChip = o.ShowMode ~= false and #modes > 1
@@ -4286,7 +4331,6 @@ local function AddKeybind(W, S, o)
 		Paint(true)
 	end
 	local function Reject(msg)
-		local T = W.Theme
 		SetProps(bs, {Color = rgb(235, 87, 87), Transparency = 0})
 		task.delay(0.35, function()
 			if picking then
@@ -4297,6 +4341,16 @@ local function AddKeybind(W, S, o)
 		end)
 		SafeCall(o.OnReject, msg)
 		if msg and W.Window then W.Window.Notify({Title = "Keybind", Content = msg, Icon = {"keyboard", "command"}, Duration = 2.5}) end
+	end
+	local function SetActive(b)
+		b = b and true or false
+		if b == active then return end
+		active = b
+		Paint(true)
+		Layout(true)
+		ListRefresh()
+		SafeCall(o.Callback, active)
+		SafeCall(o.ToggleCallback, active)
 	end
 	local function FindDuplicate(k, m)
 		local text = JoinBind(k, m)
@@ -4309,6 +4363,7 @@ local function AddKeybind(W, S, o)
 	local function SetBind(k, m, silent)
 		m = k and (m or {}) or {}
 		local before = JoinBind(key, mods)
+		if before ~= JoinBind(k, m) and mode == "Hold" then SetActive(false) end
 		key, mods = k, m
 		el.Value = k
 		StopPicking()
@@ -4335,16 +4390,6 @@ local function AddKeybind(W, S, o)
 		SetBind(k, m)
 	end
 
-	local function SetActive(b)
-		b = b and true or false
-		if b == active then return end
-		active = b
-		Paint(true)
-		Layout(true)
-		ListRefresh()
-		SafeCall(o.Callback, active)
-		SafeCall(o.ToggleCallback, active)
-	end
 	-- Same behaviour as pressing the bound key; used by touch taps and the keybind list.
 	local function Trigger(down)
 		if W.KeyLocked or not el.Enabled or not row.Parent then
@@ -4456,8 +4501,7 @@ local function AddKeybind(W, S, o)
 					Parent = menu,
 				})
 				Corner(b, 3)
-				local ic
-				if it.icon then ic = CreateIcon(b, it.icon, 11, UDim2.new(0, 6, 0.5, -5.5), it.accent and W.Accent or T.TextGray) end
+				if it.icon then CreateIcon(b, it.icon, 11, UDim2.new(0, 6, 0.5, -5.5), it.accent and W.Accent or T.TextGray) end
 				local tl = Label(b, it.text, {Position = UDim2.fromOffset(22, 0), Size = UDim2.new(1, -26, 1, 0), Color = it.accent and T.Text or T.TextGray})
 				OnMouseEnter(b, function()
 					Anim(b, {BackgroundTransparency = 0}, true)
@@ -4537,6 +4581,8 @@ local function AddKeybind(W, S, o)
 					StopPicking()
 				elseif kc == Enum.KeyCode.Backspace or kc == Enum.KeyCode.Delete then
 					SetBind(nil, nil)
+				elseif kc == Enum.KeyCode.Unknown then
+					return
 				elseif MOD_GROUP[kc.Name] then
 					pendingMod = kc
 					Layout(false)
@@ -4846,6 +4892,7 @@ local function AddSegmented(W, S, o)
 	local function Build()
 		for _, b in ipairs(buttons) do b:Destroy() end
 		table.clear(buttons)
+		segHover = nil
 		local n = math.max(#options, 1)
 		for i, opt in ipairs(options) do
 			local b = Create("TextButton", {
@@ -4866,7 +4913,6 @@ local function AddSegmented(W, S, o)
 			buttons[i] = b
 		end
 		Layout(false)
-		el._apply()
 	end
 	W.Bind(function() el._apply() end, row)
 	Build()
@@ -4898,7 +4944,7 @@ end
 
 local function AddProgressBar(W, S, o)
 	o = Opts(o)
-	local el, row = NewElement(W, S, "ProgressBar", {Enabled = o.Enabled, Disabled = o.Disabled, Visible = o.Visible}, 23)
+	local el, row = NewElement(W, S, "ProgressBar", o, 23)
 	local maxV = tonumber(o.Max) or 100
 	if maxV <= 0 then maxV = 100 end
 	local value = math.clamp(tonumber(o.Default or o.Value) or 0, 0, maxV)
@@ -4939,13 +4985,13 @@ local function AddProgressBar(W, S, o)
 	end
 	W.Bind(function() el._apply() end, row)
 
-	Method(el, "Set", function(v, instant)
+	Method(el, "Set", function(v, silent)
 		v = math.clamp(tonumber(v) or 0, 0, maxV)
-		if v == value then return end
+		local changed = v ~= value
 		value = v
 		el.Value = v
-		Layout(not instant)
-		el._fire(v)
+		if changed then Layout(true) end
+		if changed and not silent then el._fire(v) else el._sync(v) end
 	end)
 	Method(el, "Get", function() return value end)
 	Method(el, "Increment", function(d) el.Set(value + (tonumber(d) or 1)) end)
@@ -4953,17 +4999,15 @@ local function AddProgressBar(W, S, o)
 		m = tonumber(m)
 		if not m or m <= 0 then return end
 		maxV = m
+		local before = value
 		value = math.min(value, maxV)
 		el.Value = value
 		Layout(true)
+		if value ~= before then el._fire(value) end
 	end)
 	Method(el, "GetMax", function() return maxV end)
 	Method(el, "SetName", function(t) lbl.Text = tostring(t) end)
-	local defaultValue = value
-	function el._reset() el.Set(defaultValue, true) end
-	if o.DependsOn then el.DependsOn(o.DependsOn, o.InvertDependency) end
-	el._apply()
-	return el
+	return Finish(el, o)
 end
 
 local function AddRangeSlider(W, S, o)
@@ -5295,7 +5339,7 @@ local function NewSection(W, page, o)
 	else
 		col = (page.Right.count < page.Left.count) and page.Right or page.Left
 	end
-	col.count = col.count + 1
+	col.count, col.order = col.count + 1, col.order + 1
 
 	local titleText = o.Name or o.Title
 	local top = titleText and 30 or 7
@@ -5303,7 +5347,7 @@ local function NewSection(W, page, o)
 	local card = Create("Frame", {
 		Size = UDim2.new(1, 0, 0, top + bottom),
 		BorderSizePixel = 0,
-		LayoutOrder = col.count,
+		LayoutOrder = col.order,
 		Parent = col.frame,
 	})
 	W.Paint(card, "BackgroundColor3", "CardBg")
@@ -5344,6 +5388,7 @@ local function NewSection(W, page, o)
 			local el = W.Elements[i]
 			if el and el.Row:IsDescendantOf(card) then el.Destroy() end
 		end
+		if card.Parent then col.count = col.count - 1 end
 		card:Destroy()
 		W.Prune()
 	end)
@@ -5498,7 +5543,7 @@ local function NewPage(W, full)
 		local frame = Create("Frame", {Position = UDim2.fromOffset(9, 9), BackgroundTransparency = 1, Parent = scroll})
 		local layout = Create("UIListLayout", {Padding = UDim.new(0, 9), SortOrder = Enum.SortOrder.LayoutOrder, Parent = frame})
 		layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() page.Recalc() end)
-		return {frame = frame, layout = layout, count = 0}
+		return {frame = frame, layout = layout, count = 0, order = 0}
 	end
 	page.Left = Column()
 	page.Right = full and page.Left or Column()
@@ -5747,7 +5792,7 @@ local function BuildWatermark(W, cfg)
 	WM.UpdateDetails()
 	W.Maid:Spawn(function()
 		while W.Alive do
-			WM.UpdateDetails()
+			if frame.Visible then WM.UpdateDetails() end
 			task.wait(0.25)
 		end
 	end)
@@ -5760,7 +5805,7 @@ local function BuildWatermark(W, cfg)
 	end)
 	Method(api, "IsVisible", function() return wanted end)
 	function WM.ApplyLock() frame.Visible = wanted and not W.KeyLocked end
-	Method(api, "Toggle", function() frame.Visible = not frame.Visible end)
+	Method(api, "Toggle", function() api.SetVisible(not wanted) end)
 	Method(api, "SetTitle", function(t) WM.TitleItem.label.Text = tostring(t) end)
 	Method(api, "SetSite", function(t) WM.SetSite(t) end)
 	Method(api, "SetDetail", function(t)
@@ -5837,11 +5882,10 @@ local function Notify(W, o)
 	end
 	local nTitle = Label(top, o.Title or W.Title, {Position = UDim2.fromOffset(x, 0), Size = UDim2.new(1, -x, 1, 0), Color = T.Text, Weight = "SemiBold", Truncate = true})
 	if o.Content or o.Text then
-		local c = Label(card, o.Content or o.Text, {Size = UDim2.new(1, 0, 0, 0), Color = T.TextGray})
-		nContent = c
-		c.AutomaticSize = Enum.AutomaticSize.Y
-		c.TextWrapped = true
-		c.LayoutOrder = 2
+		nContent = Label(card, o.Content or o.Text, {Size = UDim2.new(1, 0, 0, 0), Color = T.TextGray})
+		nContent.AutomaticSize = Enum.AutomaticSize.Y
+		nContent.TextWrapped = true
+		nContent.LayoutOrder = 2
 	end
 	local barHost = Create("Frame", {Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1, LayoutOrder = 3, Parent = card})
 	local bar = Create("Frame", {
@@ -5868,12 +5912,12 @@ local function Notify(W, o)
 	Tween(bar, TweenInfo.new(duration, Enum.EasingStyle.Linear), {Size = UDim2.new(0, 0, 0, 2)})
 	local closed = false
 	local function Close()
-		if closed then return end
+		if closed or not W.Alive then return end
 		closed = true
 		local t = Tween(card, TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {Position = UDim2.fromOffset(260, 0)})
 		t.Completed:Connect(function() holder:Destroy() end)
 	end
-	task.delay(duration, Close)
+	W.Maid:Delay(duration, Close)
 	SafeCall(o.Callback)
 	return {Close = Close}
 end
@@ -6060,7 +6104,7 @@ end
 
 local function BuildNavigation(W)
 	function W.LayoutHeader()
-		local x = 444.5
+		local x = W.SetBtn.Position.X.Offset
 		if W.CfgBtn then
 			x = x - 30.5
 			W.CfgBtn.Position = UDim2.fromOffset(x, 4.5)
@@ -6109,7 +6153,7 @@ local function BuildNavigation(W)
 		return 0
 	end
 
-	local ActiveTweens = {}
+	local PageTweens = {}
 	local SwitchToken = 0
 	local SLIDE = 18
 	local TI_OUT = TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
@@ -6119,8 +6163,8 @@ local function BuildNavigation(W)
 	function W.ShowPage(page, animate)
 		SwitchToken = SwitchToken + 1
 		local token = SwitchToken
-		for _, t in ipairs(ActiveTweens) do t:Cancel() end
-		table.clear(ActiveTweens)
+		for _, t in ipairs(PageTweens) do t:Cancel() end
+		table.clear(PageTweens)
 		local old = W.CurrentPage
 		local dir = OrderOf(page) >= OrderOf(old) and 1 or -1
 
@@ -6136,8 +6180,8 @@ local function BuildNavigation(W)
 			if animate then
 				page.scroll.Position = UDim2.fromOffset(dir * SLIDE, HEADER_H)
 				W.Fader.BackgroundTransparency = 0
-				table.insert(ActiveTweens, Tween(page.scroll, TI_MOVE, {Position = HOME}))
-				table.insert(ActiveTweens, Tween(W.Fader, TI_FADE, {BackgroundTransparency = 1}))
+				table.insert(PageTweens, Tween(page.scroll, TI_MOVE, {Position = HOME}))
+				table.insert(PageTweens, Tween(W.Fader, TI_FADE, {BackgroundTransparency = 1}))
 			else
 				page.scroll.Position = HOME
 				W.Fader.BackgroundTransparency = 1
@@ -6148,9 +6192,9 @@ local function BuildNavigation(W)
 			Swap()
 			return
 		end
-		table.insert(ActiveTweens, Tween(old.scroll, TI_OUT, {Position = UDim2.fromOffset(-dir * SLIDE * 0.5, HEADER_H)}))
+		table.insert(PageTweens, Tween(old.scroll, TI_OUT, {Position = UDim2.fromOffset(-dir * SLIDE * 0.5, HEADER_H)}))
 		local out = TweenService:Create(W.Fader, TI_OUT, {BackgroundTransparency = 0})
-		table.insert(ActiveTweens, out)
+		table.insert(PageTweens, out)
 		out.Completed:Connect(function(state)
 			if state ~= Enum.PlaybackState.Completed or token ~= SwitchToken then return end
 			Swap()
@@ -6260,10 +6304,7 @@ local function BuildNavigation(W)
 					if Sub.tab == tab and tab.CurSub == sub then LayoutSubs(false) end
 				end)
 				b.MouseButton1Click:Connect(function()
-					if tab.CurSub == sub then return end
-					tab.CurSub = sub
-					W.Navigated = true
-					W.RefreshNav()
+					if tab.CurSub ~= sub then W.Navigate(tab, sub) end
 				end)
 				table.insert(Sub.items, it)
 			end
@@ -6290,6 +6331,7 @@ local function BuildNavigation(W)
 			local tileProps = {BackgroundTransparency = active and 0 or 1, Size = active and t.TileOn or t.TileOff}
 			local lblProps = {TextColor3 = active and T.Text or T.NavGray}
 			if instant then
+				StopTweens(t.Tile, t.Label)
 				t.Tile.BackgroundTransparency, t.Tile.Size = tileProps.BackgroundTransparency, tileProps.Size
 				t.Label.TextColor3 = lblProps.TextColor3
 			else
@@ -6303,6 +6345,7 @@ local function BuildNavigation(W)
 
 		local gearActive = W.Nav.main == "settings"
 		if instant then
+			StopTweens(W.SetBtn)
 			W.SetBtn.BackgroundTransparency = gearActive and 0 or 1
 		else
 			Tween(W.SetBtn, TI_FAST, {BackgroundTransparency = gearActive and 0 or 1})
@@ -6314,6 +6357,7 @@ local function BuildNavigation(W)
 		if W.CfgBtn then
 			local cfgActive = W.Nav.main == "configs"
 			if instant then
+				StopTweens(W.CfgBtn)
 				W.CfgBtn.BackgroundTransparency = cfgActive and 0 or 1
 			else
 				Tween(W.CfgBtn, TI_FAST, {BackgroundTransparency = cfgActive and 0 or 1})
@@ -6327,6 +6371,13 @@ local function BuildNavigation(W)
 		W.RefreshAccentIcons()
 	end
 
+	function W.Navigate(main, sub)
+		W.Nav.main = main
+		if sub then main.CurSub = sub end
+		W.Navigated = true
+		W.RefreshNav()
+	end
+
 	W.Bind(function(T)
 		for _, t in ipairs(W.Tabs) do
 			StopTweens(t.Label)
@@ -6335,11 +6386,7 @@ local function BuildNavigation(W)
 		W.RefreshAccentIcons()
 	end)
 
-	W.SetBtn.MouseButton1Click:Connect(function()
-		W.Nav.main = "settings"
-		W.Navigated = true
-		W.RefreshNav()
-	end)
+	W.SetBtn.MouseButton1Click:Connect(function() W.Navigate("settings") end)
 end
 
 local function AddTab(W, o)
@@ -6389,21 +6436,14 @@ local function AddTab(W, o)
 	table.insert(W.Tabs, tab)
 	W.RelayoutNav()
 
-	btn.MouseButton1Click:Connect(function()
-		W.Nav.main = tab
-		W.Navigated = true
-		W.RefreshNav()
-	end)
+	btn.MouseButton1Click:Connect(function() W.Navigate(tab) end)
 
 	local api = {Name = tab.Name}
 	AttachSections(W, api, tab.Page)
-	Method(api, "Select", function()
-		W.Nav.main = tab
-		W.Navigated = true
-		W.RefreshNav()
-	end)
+	Method(api, "Select", function() W.Navigate(tab) end)
 	Method(api, "SetName", function(t)
 		tab.Name = tostring(t)
+		api.Name = tab.Name
 		lbl.Text = tab.Name
 	end)
 	Method(api, "SetIcon", function(spec) ic.Visible = ApplyIcon(ic, spec) end)
@@ -6416,12 +6456,7 @@ local function AddTab(W, o)
 		if W.Nav.main == tab then W.RefreshNav(true) end
 		local sapi = {Name = sub.Name}
 		AttachSections(W, sapi, sub.Page)
-		Method(sapi, "Select", function()
-			W.Nav.main = tab
-			tab.CurSub = sub
-			W.Navigated = true
-			W.RefreshNav()
-		end)
+		Method(sapi, "Select", function() W.Navigate(tab, sub) end)
 		return sapi
 	end)
 	api.SubTab = api.AddSubTab
@@ -6453,7 +6488,7 @@ local function BuildSettings(W, o)
 	local interface = NewSection(W, page, {Name = "Interface", Side = "Left"})
 	W.ScaleDropdown = interface.AddDropdown({
 		Name = "UI Scale", Icon = {"expand", "maximize-2"},
-		Options = SCALE_OPTIONS, Default = "2.5x",
+		Options = SCALE_OPTIONS, Default = ScaleLabelFor(o.Scale),
 		Flag = "__ZeninScale",
 		Callback = function(v) W.SetScale(SCALE_MAP[v] or 1, true) end,
 	})
@@ -6485,18 +6520,32 @@ local function BuildSettings(W, o)
 
 	if W.KBList then
 		local kl = NewSection(W, page, {Name = "Keybind List", Side = "Right"})
-		kl.AddToggle({
+		W.KbListToggle = kl.AddToggle({
 			Name = "Show List", Default = W.KBList.Wanted,
 			Flag = "__ZeninKbList",
 			Callback = function(v) W.KeybindListApi.SetVisible(v) end,
 		})
-		kl.AddToggle({
+		W.KbInactiveToggle = kl.AddToggle({
 			Name = "Show Inactive", Default = W.KBList.ShowInactive,
 			Flag = "__ZeninKbInactive",
 			Callback = function(v) W.KeybindListApi.SetShowInactive(v) end,
 		})
 	end
 	return api
+end
+
+local function Trim(s)
+	return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function EnsureFolderPath(folder)
+	if not (isfolder and makefolder) then return end
+	local cur = ""
+	for part in string.gmatch(tostring(folder), "[^/\\]+") do
+		cur = cur == "" and part or (cur .. "/" .. part)
+		local ok, exists = pcall(isfolder, cur)
+		if not (ok and exists) then pcall(makefolder, cur) end
+	end
 end
 
 local function BuildConfigManager(W, Window, o)
@@ -6512,7 +6561,7 @@ local function BuildConfigManager(W, Window, o)
 	local api = {}
 
 	local function Clean(name)
-		name = tostring(name or "default"):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%.cfg$", "")
+		name = Trim(name or "default"):gsub("%.cfg$", "")
 		name = name:gsub("[^%w%-_ %.]", "_")
 		if name == "" then name = "default" end
 		return name
@@ -6521,14 +6570,7 @@ local function BuildConfigManager(W, Window, o)
 	local function EnsureFolder()
 		local f = CFG.Folder
 		if f == nil or f == "" then return nil end
-		if isfolder and makefolder then
-			local cur = ""
-			for part in string.gmatch(tostring(f), "[^/\\]+") do
-				cur = cur == "" and part or (cur .. "/" .. part)
-				local ok, exists = pcall(isfolder, cur)
-				if not (ok and exists) then pcall(makefolder, cur) end
-			end
-		end
+		EnsureFolderPath(f)
 		return f
 	end
 
@@ -6628,7 +6670,7 @@ local function BuildConfigManager(W, Window, o)
 
 	local function Decode(text)
 		if type(text) ~= "string" then return nil, "empty" end
-		text = text:gsub("^%s+", ""):gsub("%s+$", "")
+		text = Trim(text)
 		if text == "" then return nil, "empty" end
 		local ok, data = pcall(HttpService.JSONDecode, HttpService, text)
 		if not ok or type(data) ~= "table" then return nil, "invalid config" end
@@ -6725,7 +6767,7 @@ local function BuildConfigManager(W, Window, o)
 		local seen = {}
 		for _, file in ipairs(files) do
 			local n = tostring(file):match("([^/\\]+)%.cfg$")
-			if n and not seen[n] then
+			if n and Clean(n) == n and not seen[n] then
 				seen[n] = true
 				table.insert(out, n)
 			end
@@ -6752,7 +6794,7 @@ local function BuildConfigManager(W, Window, o)
 	Method(api, "Reset", function()
 		for _, el in ipairs(W.Elements) do
 			if el.Flag and el._default ~= nil and el.Flag:sub(1, 7) ~= "__Zenin" and not CFG.Ignore[el.Flag] then
-				ApplyFlag(el, el._default)
+				if el._reset then SafeCall(el._reset) else ApplyFlag(el, el._default) end
 			end
 		end
 		W.PendingFlags = nil
@@ -6978,13 +7020,8 @@ local function BuildConfigs(W, Window)
 		activeLbl.Text = text
 	end
 
-	local function BoxName()
-		local text = tostring(box.Text):gsub("^%s+", ""):gsub("%s+$", "")
-		return text
-	end
-
 	WideButton(actions._raw(27), "Create New", {"file-plus", "file"}, function()
-		local name = BoxName()
+		local name = Trim(box.Text)
 		if name == "" or #name > 64 then name = "config_" .. (#Configs.List() + 1) end
 		name = Configs.UniqueName(name)
 		local ok, err = Configs.Save(name)
@@ -7022,7 +7059,7 @@ local function HttpGetBody(url)
 end
 
 local function BodyIsValid(body)
-	local trimmed = tostring(body or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	local trimmed = Trim(body)
 	local low = trimmed:lower()
 	if low == "true" or low == "valid" or low == "ok" or low == "1" or low == "success" then return true end
 	local ok, data = pcall(function() return HttpService:JSONDecode(trimmed) end)
@@ -7054,10 +7091,6 @@ local function FormatDuration(sec)
 	if h > 0 then return ("%dh %02dm"):format(h, m) end
 	if m > 0 then return ("%dm %02ds"):format(m, s) end
 	return ("%ds"):format(s)
-end
-
-local function Trim(s)
-	return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 -- SHA-256, so key lists can ship as hashes instead of plain text and the saved-key file can be signed.
@@ -7168,7 +7201,11 @@ local function KeyBackend(ks, ctx)
 	if type(hashList) == "string" then hashList = {hashList} end
 	for k, v in pairs(type(hashList) == "table" and hashList or {}) do
 		if type(k) == "number" then
-			hashes[Trim(v):lower()] = {}
+			if type(v) == "table" then
+				if v.Hash ~= nil then hashes[Trim(v.Hash):lower()] = NormKeySpec(v) end
+			else
+				hashes[Trim(v):lower()] = {}
+			end
 		else
 			local spec = NormKeySpec(v)
 			if spec then hashes[Trim(k):lower()] = spec end
@@ -7286,14 +7323,7 @@ local function KeyBackend(ks, ctx)
 	end
 	function B.Save(key, activated)
 		if ks.SaveKey == false or not writefile then return end
-		if folder and folder ~= "" and isfolder and makefolder then
-			local cur = ""
-			for part in string.gmatch(tostring(folder), "[^/\\]+") do
-				cur = cur == "" and part or (cur .. "/" .. part)
-				local ok, exists = pcall(isfolder, cur)
-				if not (ok and exists) then pcall(makefolder, cur) end
-			end
-		end
+		if folder and folder ~= "" then EnsureFolderPath(folder) end
 		activated = math.floor(tonumber(activated) or Now())
 		key = Norm(key)
 		pcall(writefile, savePath, key .. "\n" .. tostring(activated) .. "\n" .. Sig(key, activated))
@@ -7304,12 +7334,13 @@ local function KeyBackend(ks, ctx)
 		if not (ok and exists) then return nil end
 		local ok2, data = pcall(readfile, savePath)
 		if not (ok2 and type(data) == "string") then return nil end
-		local key, activated, sig = data:match("^([^\n]*)\n(%d+)\n(%x+)")
+		local key, stamp, sig = data:match("^([^\n]*)\n(%d+)\n(%x+)")
+		local activated = tonumber(stamp)
 		if not key or key == "" or not activated then
 			B.Forget()
 			return nil
 		end
-		activated = math.floor(tonumber(activated))
+		activated = math.floor(activated)
 		if sig:lower() ~= Sig(key, activated) then
 			B.Forget()
 			return nil
@@ -7559,7 +7590,7 @@ local function RunKeySystem(ks, ctx)
 	local maxAttempts = tonumber(ks.MaxAttempts)
 	local lockTime = tonumber(ks.Cooldown) or 30
 
-	local function Finish(result, info)
+	local function Complete(result, info)
 		if finished then return end
 		finished = true
 		VKB.SetReady(keyboardWasReady)
@@ -7594,7 +7625,7 @@ local function RunKeySystem(ks, ctx)
 				B.Save(key, activated)
 				local info = {Key = B.Normalize(key), Expires = exp, Activated = activated, Hwid = B.Hwid,
 					Source = meta and meta.Source or "static", Note = meta and meta.Note or nil}
-				task.delay(0.35, function() Finish(true, info) end)
+				task.delay(0.35, function() Complete(true, info) end)
 				return
 			end
 			if fromSave then
@@ -7621,10 +7652,11 @@ local function RunKeySystem(ks, ctx)
 		end)
 	end
 
+	gui.Destroying:Connect(function() Complete(false) end)
 	verifyBtn.MouseButton1Click:Connect(function() Attempt(box.Text) end)
 	onKeyEnter = function() Attempt(box.Text) end
 	closeBtn.MouseButton1Click:Connect(function()
-		if ks.CanClose ~= false then Finish(false) end
+		if ks.CanClose ~= false then Complete(false) end
 	end)
 	if getBtn then
 		getBtn.MouseButton1Click:Connect(function()
@@ -7707,6 +7739,12 @@ local function CreateWindow(o)
 	}
 	W.LogoSpec = NormalizeLogo(o.Logo or o.Icon, W.Title)
 	LoadIcons()
+	-- Placeholder until Window.Destroy exists, so a build that errors part-way can still be released.
+	LiveWindows[guiKey] = function()
+		W.Alive = false
+		W.Maid:Destroy()
+		VKB.SetReady(true)
+	end
 
 	function W.Bind(fn, owner)
 		table.insert(W.Listeners, {fn = fn, owner = owner})
@@ -7871,7 +7909,7 @@ local function CreateWindow(o)
 		W.SetAccent(c, alpha)
 	end
 	function W.SetTheme(name)
-		local t = Library.Themes[name]
+		local t = W.Alive and Library.Themes[name]
 		if not t then return false end
 		W.Theme, W.ThemeName = t, name
 		W.Refresh()
@@ -7881,6 +7919,7 @@ local function CreateWindow(o)
 	function W.SetScale(s, animate)
 		s = math.clamp(tonumber(s) or 1, 0.3, 3)
 		W.UserScale = s
+		if W.ScaleDropdown and SCALE_MAP[W.ScaleDropdown.Get()] ~= s then W.ScaleDropdown.Set(ScaleLabelFor(s), true) end
 		-- The open/close animation drives W.Scale; it lands on UserScale when it finishes.
 		if W.Animating then return end
 		if animate then
@@ -8022,11 +8061,7 @@ local function CreateWindow(o)
 	Window.Tab = Window.AddTab
 	Window.CreateTab = Window.AddTab
 	Method(Window, "AddSettingsSection", function(x) return settingsApi.AddSection(x) end)
-	Method(Window, "SelectSettings", function()
-		W.Nav.main = "settings"
-		W.Navigated = true
-		W.RefreshNav()
-	end)
+	Method(Window, "SelectSettings", function() W.Navigate("settings") end)
 
 	Method(Window, "SetTitle", function(t)
 		W.Title = tostring(t)
@@ -8058,7 +8093,7 @@ local function CreateWindow(o)
 	Method(Window, "Toggle", function(instant) W.SetShown(not W.Visible, instant) end)
 	Method(Window, "IsVisible", function() return W.Visible end)
 	Method(Window, "SetAnimation", function(b) W.Animate = b ~= false end)
-	Method(Window, "SetToggleKey", function(k) W.ToggleKey = ParseKey(k) end)
+	Method(Window, "SetToggleKey", function(k) W.ToggleKey = ParseKey(k) or W.ToggleKey end)
 	Method(Window, "GetToggleKey", function() return W.ToggleKey end)
 	Method(Window, "SetPosition", function(p) W.Holder.Position = p end)
 	Method(Window, "Center", function()
@@ -8124,9 +8159,7 @@ local function CreateWindow(o)
 	end)
 	Method(Window, "SelectConfigs", function()
 		if not W.ConfigPage then return end
-		W.Nav.main = "configs"
-		W.Navigated = true
-		W.RefreshNav()
+		W.Navigate("configs")
 		W.RefreshConfigs()
 	end)
 	Method(Window, "RefreshConfigs", function() if W.RefreshConfigs then W.RefreshConfigs() end end)
@@ -8341,7 +8374,18 @@ local function CreateWindow(o)
 	return Window
 end
 
-Method(Library, "CreateWindow", CreateWindow)
+Method(Library, "CreateWindow", function(o)
+	o = Opts(o)
+	local ok, res = pcall(CreateWindow, o)
+	if ok then return res end
+	-- Release a half-built window (its Maid owns everything created so far) before re-raising.
+	local abort = LiveWindows[o.GuiName or Library.GuiName]
+	if type(abort) == "function" then
+		LiveWindows[o.GuiName or Library.GuiName] = nil
+		pcall(abort)
+	end
+	error(res, 0)
+end)
 Method(Library, "KeySystem", function(ks, ctx) return RunKeySystem(ks, type(ctx) == "table" and ctx or {}) end)
 Library.FormatDuration = FormatDuration
 Library.Sha256 = Sha256
@@ -8355,8 +8399,11 @@ Method(Library, "Notify", function(o)
 end)
 Method(Library, "Unload", function()
 	for _, w in ipairs(CopyList(Library.Windows)) do w.Destroy() end
-	if Library.ActiveWindow then Library.ActiveWindow.Destroy() end
 	VKB.Destroy()
+end)
+Library.Destroy = Library.Unload
+Method(Library, "SetTheme", function(name)
+	return Library.ActiveWindow ~= nil and Library.ActiveWindow.SetTheme(name)
 end)
 
 return Library
