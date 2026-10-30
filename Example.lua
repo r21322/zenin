@@ -19,6 +19,7 @@ local Window = Library.CreateWindow({
 	Accent = Color3.fromRGB(255, 89, 89),
 	ToggleKey = Enum.KeyCode.RightShift,
 	Scale = 1,
+	Transition = "Soft Dissolve", -- tab switch animation; try them all in Settings > Interface > Tab Animation
 	ConfigFolder = "ZeninShowcase",
 	Configs = {AutoLoad = true},
 	Watermark = {

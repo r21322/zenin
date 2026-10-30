@@ -472,6 +472,27 @@ local function ScaleLabelFor(scale)
 	end
 	return best
 end
+-- Tab-switch presets, picked with Window.SetTransition / the settings dropdown. Two phases: "out"
+-- covers the old page with the veil (W.Fader) while it drifts away, "in" lifts the veil while the
+-- new page drifts/zooms into place. Drift is in pixels, signed by tab order unless Fixed = true;
+-- Zoom is the starting scale. Push slides both pages across without a veil; None cuts instantly.
+local PAGE_TRANSITIONS = (function()
+	local E, D = Enum.EasingStyle, Enum.EasingDirection
+	local list = {
+		{Name = "Soft Dissolve", Out = {0.14, E.Sine, D.InOut, 6}, In = {0.36, E.Cubic, D.Out, 10}, Reveal = {0.3, E.Sine, D.Out, 0.05}},
+		{Name = "Classic Slide", Out = {0.1, E.Quad, D.In, 9}, In = {0.4, E.Quint, D.Out, 18}, Reveal = {0.3, E.Quart, D.Out, 0}},
+		{Name = "Fade", Out = {0.16, E.Sine, D.InOut, 0}, In = {0.3, E.Sine, D.Out, 0}, Reveal = {0.26, E.Sine, D.Out, 0}},
+		{Name = "Rise", Axis = "Y", Fixed = true, Out = {0.14, E.Quad, D.In, -4}, In = {0.42, E.Quint, D.Out, 16}, Reveal = {0.3, E.Quad, D.Out, 0.03}},
+		{Name = "Zoom In", Out = {0.14, E.Quad, D.In, 0, 1.03}, In = {0.4, E.Quint, D.Out, 0, 0.94}, Reveal = {0.28, E.Sine, D.Out, 0.02}},
+		{Name = "Zoom Out", Out = {0.14, E.Quad, D.In, 0, 0.97}, In = {0.4, E.Quint, D.Out, 0, 1.06}, Reveal = {0.28, E.Sine, D.Out, 0.02}},
+		{Name = "Push", Push = true, In = {0.42, E.Quint, D.Out}},
+		{Name = "Spring", Out = {0.12, E.Quad, D.In, 8}, In = {0.55, E.Back, D.Out, 22}, Reveal = {0.22, E.Quad, D.Out, 0}},
+		{Name = "Snappy", Out = {0.06, E.Linear, D.In, 4}, In = {0.18, E.Quart, D.Out, 8}, Reveal = {0.16, E.Quad, D.Out, 0}},
+		{Name = "Instant", None = true},
+	}
+	for _, t in ipairs(list) do list[t.Name] = t end
+	return list
+end)()
 local DETAIL_MODES = {"Time", "FPS", "Ping", "Product Type"}
 local DETAIL_ICONS = {Time = "clock", FPS = "activity", Ping = "wifi", ["Product Type"] = "monitor"}
 local WHITE = Color3.new(1, 1, 1)
@@ -5437,7 +5458,7 @@ end
 local function NewPage(W, full)
 	local scroll = Create("ScrollingFrame", {
 		Size = UDim2.fromOffset(WIN_W, BODY_H),
-		Position = UDim2.fromOffset(0, HEADER_H),
+		Position = UDim2.fromOffset(0, 0),
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
 		ZIndex = 2,
@@ -5452,7 +5473,7 @@ local function NewPage(W, full)
 		CanvasSize = UDim2.fromOffset(0, 0),
 		ScrollingDirection = Enum.ScrollingDirection.Y,
 		Visible = false,
-		Parent = W.Main,
+		Parent = W.PageClip,
 	})
 	local hit = Create("Frame", {BackgroundTransparency = 1, Active = true, Visible = false, ZIndex = 7, Parent = W.Main})
 	local track = Create("Frame", {BorderSizePixel = 0, ZIndex = 7, Parent = hit})
@@ -5573,7 +5594,7 @@ local function NewPage(W, full)
 	hit.MouseLeave:Connect(function() hovering = false ThumbColor() end)
 
 	function page.Recalc()
-		local sc = W.Scale.Scale
+		local sc = W.Scale.Scale * (page.zoom and page.zoom.Scale or 1)
 		if sc <= 0 or not (page.Left and page.Right) then return end
 		local h = math.max(page.Left.layout.AbsoluteContentSize.Y, page.Right.layout.AbsoluteContentSize.Y) / sc
 		page.SetCanvas(h > 0 and (h + 18) or 0)
@@ -6098,6 +6119,15 @@ local function BuildShell(W)
 		Tween(BottomFade, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = on and 0 or 1})
 	end
 
+	-- Pages slide inside this, so transitions never draw outside the window body.
+	W.PageClip = Create("Frame", {
+		Size = UDim2.new(1, 0, 0, BODY_H),
+		Position = UDim2.fromOffset(0, HEADER_H),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		ZIndex = 2,
+		Parent = Main,
+	})
 	W.Fader = Create("Frame", {
 		Size = UDim2.new(1, 0, 0, BODY_H),
 		Position = UDim2.fromOffset(0, HEADER_H),
@@ -6184,58 +6214,110 @@ local function BuildNavigation(W)
 		return 0
 	end
 
-	-- Page switch: a soft dissolve rather than a jump. The outgoing page eases a few pixels back
-	-- while the veil (W.Fader) eases in; under the veil the pages swap, then the new page drifts
-	-- the last few pixels into place as the veil lifts. The reveal is slightly delayed and slower
-	-- than the drift, so the motion is already settling by the time the content is visible.
 	local PageTweens = {}
 	local SwitchToken = 0
-	local DRIFT_OUT, DRIFT_IN = 6, 10
-	local TI_OUT = TweenInfo.new(0.14, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
-	local TI_MOVE = TweenInfo.new(0.36, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
-	local TI_REVEAL = TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out, 0, false, 0.05)
-	local HOME = UDim2.fromOffset(0, HEADER_H)
-	local function Offset(x) return UDim2.fromOffset(x, HEADER_H) end
+	local HOME = UDim2.fromOffset(0, 0)
+	local function Info(p, delayIndex)
+		return TweenInfo.new(p[1], p[2], p[3], 0, false, delayIndex and p[delayIndex] or 0)
+	end
+	-- Position for a page drifted by d px along the axis and scaled to z about its centre.
+	local function Place(tr, d, z)
+		z = z or 1
+		local cx, cy = (1 - z) * WIN_W / 2, (1 - z) * BODY_H / 2
+		if tr.Axis == "Y" then return UDim2.fromOffset(cx, cy + d) end
+		return UDim2.fromOffset(cx + d, cy)
+	end
+	local function Zoom(page)
+		page.zoom = page.zoom or Create("UIScale", {Scale = 1, Parent = page.scroll})
+		return page.zoom
+	end
+	local function Rest(p)
+		p.scroll.Position = HOME
+		if p.zoom then p.zoom.Scale = 1 end
+	end
+
+	function W.GetTransition()
+		return PAGE_TRANSITIONS[W.TransitionName] and W.TransitionName or PAGE_TRANSITIONS[1].Name
+	end
+	function W.SetTransition(name)
+		if not PAGE_TRANSITIONS[name] then return false end
+		W.TransitionName = name
+		if W.TransitionDropdown and W.TransitionDropdown.Get() ~= name then W.TransitionDropdown.Set(name, true) end
+		return true
+	end
+
 	function W.ShowPage(page, animate)
 		SwitchToken = SwitchToken + 1
 		local token = SwitchToken
 		for _, t in ipairs(PageTweens) do t:Cancel() end
 		table.clear(PageTweens)
 		local old = W.CurrentPage
+		local tr = PAGE_TRANSITIONS[W.GetTransition()]
 		local dir = OrderOf(page) >= OrderOf(old) and 1 or -1
+		local sign = tr.Fixed and 1 or dir
 
-		local function Swap()
+		local function Swap(reveal)
 			for _, p in ipairs(W.Pages) do
 				if p ~= page then
 					p.Show(false)
-					p.scroll.Position = HOME
+					Rest(p)
 				end
 			end
 			page.ScrollTo(0, true)
 			page.Show(true)
-			if animate then
-				page.scroll.Position = Offset(dir * DRIFT_IN)
-				W.Fader.BackgroundTransparency = 0
-				table.insert(PageTweens, Tween(page.scroll, TI_MOVE, {Position = HOME}))
-				table.insert(PageTweens, Tween(W.Fader, TI_REVEAL, {BackgroundTransparency = 1}))
-			else
-				page.scroll.Position = HOME
+			Rest(page)
+			if not reveal then
 				W.Fader.BackgroundTransparency = 1
+				return
 			end
+			local into = tr.In
+			W.Fader.BackgroundTransparency = 0
+			page.scroll.Position = Place(tr, sign * (into[4] or 0), into[5])
+			if into[5] then Zoom(page).Scale = into[5] end
+			local ti = Info(into)
+			table.insert(PageTweens, Tween(page.scroll, ti, {Position = HOME}))
+			if into[5] then table.insert(PageTweens, Tween(page.zoom, ti, {Scale = 1})) end
+			table.insert(PageTweens, Tween(W.Fader, Info(tr.Reveal, 4), {BackgroundTransparency = 1}))
 		end
 
-		if not animate or not old then
-			Swap()
+		if not animate or not old or old == page or tr.None then
+			Swap(false)
 			return
 		end
-		table.insert(PageTweens, Tween(old.scroll, TI_OUT, {Position = Offset(-dir * DRIFT_OUT)}))
-		local out = TweenService:Create(W.Fader, TI_OUT, {BackgroundTransparency = 0})
-		table.insert(PageTweens, out)
-		out.Completed:Connect(function(state)
+
+		if tr.Push then
+			for _, p in ipairs(W.Pages) do
+				if p ~= page and p ~= old then p.Show(false) Rest(p) end
+			end
+			W.Fader.BackgroundTransparency = 1
+			if old.zoom then old.zoom.Scale = 1 end
+			page.ScrollTo(0, true)
+			page.Show(true)
+			Rest(page)
+			page.scroll.Position = UDim2.fromOffset(dir * WIN_W, 0)
+			local ti = Info(tr.In)
+			table.insert(PageTweens, Tween(old.scroll, ti, {Position = UDim2.fromOffset(-dir * WIN_W, 0)}))
+			local t = Tween(page.scroll, ti, {Position = HOME})
+			table.insert(PageTweens, t)
+			t.Completed:Connect(function(state)
+				if state ~= Enum.PlaybackState.Completed or token ~= SwitchToken then return end
+				old.Show(false)
+				Rest(old)
+			end)
+			return
+		end
+
+		local out = tr.Out
+		local ti = Info(out)
+		table.insert(PageTweens, Tween(old.scroll, ti, {Position = Place(tr, -sign * (out[4] or 0), out[5])}))
+		if out[5] then table.insert(PageTweens, Tween(Zoom(old), ti, {Scale = out[5]})) end
+		local veil = TweenService:Create(W.Fader, ti, {BackgroundTransparency = 0})
+		table.insert(PageTweens, veil)
+		veil.Completed:Connect(function(state)
 			if state ~= Enum.PlaybackState.Completed or token ~= SwitchToken then return end
-			Swap()
+			Swap(true)
 		end)
-		out:Play()
+		veil:Play()
 	end
 
 	function W.RefreshAccentIcons()
@@ -6527,6 +6609,17 @@ local function BuildSettings(W, o)
 		Options = SCALE_OPTIONS, Default = ScaleLabelFor(o.Scale),
 		Flag = "__ZeninScale",
 		Callback = function(v) W.SetScale(SCALE_MAP[v] or 1, true) end,
+	})
+	W.TransitionDropdown = interface.AddDropdown({
+		Name = "Tab Animation", Icon = {"layers", "square-stack"},
+		Options = (function()
+			local names = {}
+			for i, t in ipairs(PAGE_TRANSITIONS) do names[i] = t.Name end
+			return names
+		end)(),
+		Default = W.GetTransition(),
+		Flag = "__ZeninTransition",
+		Callback = function(v) W.SetTransition(v) end,
 	})
 	W.ScrollSlider = interface.AddSlider({
 		Name = "Scrollbar Size", Min = 3, Max = 24, Default = W.BarW, Suffix = "px",
@@ -7766,6 +7859,7 @@ local function CreateWindow(o)
 		WheelScroll = o.MouseWheel == true,
 		ToggleKey = ParseKey(o.ToggleKey or o.Keybind) or Enum.KeyCode.RightShift,
 		Nav = {main = "settings"},
+		TransitionName = o.Transition,
 		NotifyOrder = 0,
 		ConfigFolder = o.ConfigFolder or Library.ConfigFolder,
 	}
@@ -8125,6 +8219,13 @@ local function CreateWindow(o)
 	Method(Window, "Toggle", function(instant) W.SetShown(not W.Visible, instant) end)
 	Method(Window, "IsVisible", function() return W.Visible end)
 	Method(Window, "SetAnimation", function(b) W.Animate = b ~= false end)
+	Method(Window, "SetTransition", function(name) return W.SetTransition(name) end)
+	Method(Window, "GetTransition", function() return W.GetTransition() end)
+	Method(Window, "GetTransitions", function()
+		local names = {}
+		for i, t in ipairs(PAGE_TRANSITIONS) do names[i] = t.Name end
+		return names
+	end)
 	Method(Window, "SetToggleKey", function(k) W.ToggleKey = ParseKey(k) or W.ToggleKey end)
 	Method(Window, "GetToggleKey", function() return W.ToggleKey end)
 	Method(Window, "SetPosition", function(p) W.Holder.Position = p end)
