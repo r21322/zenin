@@ -728,6 +728,48 @@ local function ToAlpha(a)
 	return math.clamp(a, 0, 1)
 end
 
+local function Luminance(c)
+	return 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
+end
+
+-- Text/dot colour that stays readable on top of the accent.
+local function OnAccent(W)
+	if W.AccentAlpha < 0.5 then return W.Theme.Text end
+	return Luminance(W.Accent) > 0.62 and rgb(20, 20, 24) or WHITE
+end
+
+-- Picks `preferred` unless it would vanish against the accent (e.g. a white dot on a white accent).
+local function OnAccentOr(W, preferred)
+	local bg = W.Theme.ToggleOffBg:Lerp(W.Accent, W.AccentAlpha)
+	if math.abs(Luminance(preferred) - Luminance(bg)) >= 0.3 then return preferred end
+	return Luminance(bg) > 0.5 and rgb(20, 20, 24) or WHITE
+end
+
+-- Soft accent wash on the left edge of a header. A UIGradient is baked into a small texture, so a
+-- ramp squeezed into the first ~16% of a full-width header renders blocky; giving the ramp its own
+-- narrow frame uses the gradient's full range. Returns a repaint function(accent, alpha).
+local WASH_FADE = NumberSequence.new({
+	NumberSequenceKeypoint.new(0, 0),
+	NumberSequenceKeypoint.new(0.25, 0.44),
+	NumberSequenceKeypoint.new(0.5, 0.75),
+	NumberSequenceKeypoint.new(0.75, 0.94),
+	NumberSequenceKeypoint.new(1, 1),
+})
+local function AccentWash(header, radius, strength, width)
+	-- Same ZIndex as its siblings: it must sit above the header's corner fill (created before it)
+	-- and below the brand/title (created after it).
+	local wash = Create("Frame", {Size = UDim2.new(0, width or 80, 1, 0), BorderSizePixel = 0, Parent = header})
+	Corner(wash, radius)
+	local fill = Create("Frame", {Size = UDim2.new(1, 0, 0.5, 0), Position = UDim2.fromScale(0, 0.5), BorderSizePixel = 0, Parent = wash})
+	Create("UIGradient", {Transparency = WASH_FADE, Parent = wash})
+	Create("UIGradient", {Transparency = WASH_FADE, Parent = fill})
+	return function(accent, alpha)
+		local t = 1 - strength * (alpha or 1)
+		wash.BackgroundColor3, fill.BackgroundColor3 = accent, accent
+		wash.BackgroundTransparency, fill.BackgroundTransparency = t, t
+	end
+end
+
 local function MakeDraggable(W, handle, target, opts)
 	opts = opts or {}
 	local THRESH = 4
@@ -1011,18 +1053,13 @@ local function AttachSettings(W, el, place)
 		local fs = Stroke(frame, WHITE, 1)
 		W.Paint(fs, "Color", "BoxBorder")
 
-		local header = Create("Frame", {Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = frame})
+		local header = Create("Frame", {Size = UDim2.new(1, 0, 0, 26), BorderSizePixel = 0, Parent = frame})
 		Corner(header, 4)
-		local hfill = Create("Frame", {Size = UDim2.new(1, 0, 0, 13), Position = UDim2.fromOffset(0, 13), BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = header})
-		local grads = {Create("UIGradient", {Parent = header}), Create("UIGradient", {Parent = hfill})}
-		W.Bind(function(T, accent, alpha)
-			local seq = ColorSequence.new({
-				ColorSequenceKeypoint.new(0, T.BarBg:Lerp(accent, 0.1 * (alpha or 1))),
-				ColorSequenceKeypoint.new(0.35, T.BarBg),
-				ColorSequenceKeypoint.new(1, T.BarBg),
-			})
-			for _, g in ipairs(grads) do g.Color = seq end
-		end, header)
+		W.Paint(header, "BackgroundColor3", "BarBg")
+		local hfill = Create("Frame", {Size = UDim2.new(1, 0, 0, 13), Position = UDim2.fromOffset(0, 13), BorderSizePixel = 0, Parent = header})
+		W.Paint(hfill, "BackgroundColor3", "BarBg")
+		local wash = AccentWash(header, 4, 0.1)
+		W.Bind(function(_, accent, alpha) wash(accent, alpha) end, header)
 		local line = Create("Frame", {Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1), BorderSizePixel = 0, Parent = header})
 		W.Paint(line, "BackgroundColor3", "BarLine")
 		local brand = Create("Frame", {
@@ -1064,8 +1101,23 @@ local function AttachSettings(W, el, place)
 			content.Size = UDim2.new(1, -18, 0, h)
 			return 35 + h + 10
 		end
+		-- Content that settles while the panel is still growing retargets the running tween
+		-- instead of snapping, so the open animation stays smooth to the end.
+		local sizing
+		local function Resize(animate)
+			local target = UDim2.fromOffset(PANEL_W, Height())
+			if sizing then
+				pcall(function() sizing:Cancel() end)
+				sizing = nil
+			end
+			if animate then
+				sizing = Tween(frame, POP_SIZE, {Size = target})
+			else
+				SetProps(frame, {Size = target})
+			end
+		end
 		layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-			if open then SetProps(frame, {Size = UDim2.fromOffset(PANEL_W, Height())}) end
+			if open then Resize(sizing ~= nil and sizing.PlaybackState == Enum.PlaybackState.Playing) end
 		end)
 
 		local P = {Order = 0, Content = content, Frame = frame}
@@ -1077,13 +1129,15 @@ local function AttachSettings(W, el, place)
 			local rel = (gear.AbsolutePosition - W.Main.AbsolutePosition) / sc
 			frame.Position = UDim2.fromOffset(rel.X, rel.Y + gear.AbsoluteSize.Y / sc + 8)
 			frame.Size = UDim2.fromOffset(PANEL_W, 26)
-			W.PushPopup(frame, owner, {Keep = true, OnClose = function()
+			-- Fade = false: the clip-reveal is the animation; a CanvasGroup re-rasterising a
+			-- resizing frame every frame (and the reparent when it ends) is what caused the hitch.
+			W.PushPopup(frame, owner, {Keep = true, Fade = false, OnClose = function()
 				open = false
 				PaintGear(true)
 			end})
 			open = true
 			PaintGear(true)
-			Tween(frame, POP_SIZE, {Size = UDim2.fromOffset(PANEL_W, Height())})
+			Resize(true)
 		end)
 		Method(P, "Close", function() W.ClosePopupOf(owner) end)
 		Method(P, "IsOpen", function() return open end)
@@ -1221,7 +1275,7 @@ local function AddToggle(W, S, o)
 		local bg, bgT, dotC, dotPos
 		if state then
 			bg, bgT = W.Accent, 1 - W.AccentAlpha * (enabled and 1 or 0.45)
-			dotC, dotPos = T.ToggleOnDot, UDim2.new(1, -11, 0.5, -4)
+			dotC, dotPos = OnAccentOr(W, T.ToggleOnDot), UDim2.new(1, -11, 0.5, -4)
 		else
 			bg = enabled and T.ToggleOffBg or T.ToggleOffBgOff
 			bgT = 0
@@ -1325,13 +1379,6 @@ local function AddSlider(W, S, o)
 	local knob = Create("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(7, 7), BorderSizePixel = 0, ZIndex = 3, Parent = track})
 	Create("UICorner", {CornerRadius = UDim.new(1, 0), Parent = knob})
 	local ks = Stroke(knob, WHITE, 2)
-	local slHover, slDrag = false, false
-	local function KnobFx()
-		local big = (slHover or slDrag) and el.Enabled
-		Anim(knob, {Size = big and UDim2.fromOffset(9, 9) or UDim2.fromOffset(7, 7)}, true, MOVE_TI)
-	end
-	OnMouseEnter(hit, function() slHover = true KnobFx() end)
-	hit.MouseLeave:Connect(function() slHover = false KnobFx() end)
 
 	local SLIDE = TweenInfo.new(0.12, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 	local function Layout(animate)
@@ -1395,12 +1442,7 @@ local function AddSlider(W, S, o)
 		SetValue(minV + (maxV - minV) * p)
 	end
 	hit.InputBegan:Connect(function(input)
-		if el.Enabled and IsClickOrTouch(input) and W.BeginDrag(input, Update, function()
-			slDrag = false
-			KnobFx()
-		end) then
-			slDrag = true
-			KnobFx()
+		if el.Enabled and IsClickOrTouch(input) and W.BeginDrag(input, Update) then
 			Update(input)
 		end
 	end)
@@ -4836,13 +4878,6 @@ local function AddDivider(W, S, o)
 end
 
 -- Readable foreground for text/icons drawn on top of the accent color.
-local function OnAccent(W)
-	if W.AccentAlpha < 0.5 then return W.Theme.Text end
-	local c = W.Accent
-	local l = 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
-	return l > 0.62 and rgb(20, 20, 24) or WHITE
-end
-
 local function AddSegmented(W, S, o)
 	o = Opts(o)
 	local options = CopyList(o.Options or o.Values or o.List)
@@ -5124,12 +5159,7 @@ local function AddRangeSlider(W, S, o)
 		else
 			active = (v - lo <= hi - v) and 1 or 2
 		end
-		if W.BeginDrag(input, Update, function()
-			Anim(knobs[active], {Size = UDim2.fromOffset(7, 7)}, true, MOVE_TI)
-		end) then
-			Anim(knobs[active], {Size = UDim2.fromOffset(9, 9)}, true, MOVE_TI)
-			Update(input)
-		end
+		if W.BeginDrag(input, Update) then Update(input) end
 	end)
 
 	Method(el, "Set", function(v, silent)
@@ -5941,30 +5971,22 @@ local function BuildShell(W)
 
 	local Header = Create("Frame", {
 		Size = UDim2.new(1, 0, 0, HEADER_H),
-		BackgroundColor3 = WHITE,
 		BorderSizePixel = 0,
 		Active = true,
 		ZIndex = 8,
 		Parent = Main,
 	})
 	Corner(Header, 6)
+	W.Paint(Header, "BackgroundColor3", "BarBg")
 	local HeaderFill = Create("Frame", {
 		Size = UDim2.new(1, 0, 0, HEADER_H / 2),
 		Position = UDim2.new(0, 0, 0, HEADER_H / 2),
-		BackgroundColor3 = WHITE,
 		BorderSizePixel = 0,
 		Parent = Header,
 	})
-	local grads = {Create("UIGradient", {Parent = Header}), Create("UIGradient", {Parent = HeaderFill})}
-	W.Bind(function(T, accent, alpha)
-		local tint = T.BarBg:Lerp(accent, 0.07 * (alpha or 1))
-		local seq = ColorSequence.new({
-			ColorSequenceKeypoint.new(0, tint),
-			ColorSequenceKeypoint.new(0.16, T.BarBg),
-			ColorSequenceKeypoint.new(1, T.BarBg),
-		})
-		for _, g in ipairs(grads) do g.Color = seq end
-	end, Header)
+	W.Paint(HeaderFill, "BackgroundColor3", "BarBg")
+	local wash = AccentWash(Header, 6, 0.07)
+	W.Bind(function(_, accent, alpha) wash(accent, alpha) end, Header)
 	local hl = Create("Frame", {Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1), BorderSizePixel = 0, Parent = Header})
 	W.Paint(hl, "BackgroundColor3", "BarLine")
 	MakeDraggable(W, Header, Holder)
@@ -7427,16 +7449,10 @@ local function RunKeySystem(ks, ctx)
 	Corner(main, 6)
 	Stroke(main, T.BoxBorder, 1)
 
-	local header = Create("Frame", {Size = UDim2.new(1, 0, 0, HEADER_H), BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = main})
+	local header = Create("Frame", {Size = UDim2.new(1, 0, 0, HEADER_H), BackgroundColor3 = T.BarBg, BorderSizePixel = 0, Parent = main})
 	Corner(header, 6)
-	local hfill = Create("Frame", {Size = UDim2.new(1, 0, 0, HEADER_H / 2), Position = UDim2.fromOffset(0, HEADER_H / 2), BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = header})
-	local seq = ColorSequence.new({
-		ColorSequenceKeypoint.new(0, T.BarBg:Lerp(K.Accent, 0.07 * K.AccentAlpha)),
-		ColorSequenceKeypoint.new(0.16, T.BarBg),
-		ColorSequenceKeypoint.new(1, T.BarBg),
-	})
-	Create("UIGradient", {Color = seq, Parent = header})
-	Create("UIGradient", {Color = seq, Parent = hfill})
+	Create("Frame", {Size = UDim2.new(1, 0, 0, HEADER_H / 2), Position = UDim2.fromOffset(0, HEADER_H / 2), BackgroundColor3 = T.BarBg, BorderSizePixel = 0, Parent = header})
+	AccentWash(header, 6, 0.07)(K.Accent, K.AccentAlpha)
 	Create("Frame", {Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1), BackgroundColor3 = T.BarLine, BorderSizePixel = 0, Parent = header})
 
 	local brand = Create("Frame", {Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, Position = UDim2.fromOffset(9, 0), BackgroundTransparency = 1, Parent = header})
@@ -7891,7 +7907,7 @@ local function CreateWindow(o)
 		frame.ZIndex = z + 1
 		frame.Parent = W.PopupLayer
 		frame.Visible = true
-		FadeContent(frame, W.PopupLayer, UDim2.fromScale(1, 1), true, POP_IN, z + 1)
+		if opts.Fade ~= false then FadeContent(frame, W.PopupLayer, UDim2.fromScale(1, 1), true, POP_IN, z + 1) end
 		table.insert(W.Popups, {frame = frame, owner = owner, keep = opts.Keep, catcher = catcher, onClose = opts.OnClose})
 		W.PopupLayer.Visible = true
 	end
