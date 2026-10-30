@@ -1,3 +1,5 @@
+-- Luau caps a function at 200 locals, and an executor compiling at -O0 counts every one of them, so
+-- keep file-scope locals well below that: section-only helpers live in do-blocks.
 local Library = {
 	Flags = {},
 	Options = {},
@@ -2218,6 +2220,8 @@ local function AddPlainButton(W, S, o)
 	return el
 end
 
+local VKB, TouchDevice, AttachKeyboard
+do -- on-screen keyboard
 -- On-screen keyboard used instead of the phone's native one. Full-width docked by default (like a
 -- normal phone keyboard); the minimise button turns it into a small draggable panel.
 -- One shared instance; it follows whichever TextBox was tapped. Everything is driven by the
@@ -2321,7 +2325,7 @@ local KB_DEFAULTS = {
 	Colors = {},
 }
 
-local VKB = {Covers = setmetatable({}, {__mode = "k"}), Held = {}, Undo = {}, Redo = {}, Actions = {},
+VKB = {Covers = setmetatable({}, {__mode = "k"}), Held = {}, Undo = {}, Redo = {}, Actions = {},
 	Hooks = {Open = {}, Close = {}, Key = {}, Change = {}, Layout = {}, Enter = {}}, Ready = true,
 	Shift = false, Caps = false, SelectMode = false}
 VKB.Cfg = {Colors = {}}
@@ -2342,7 +2346,7 @@ local function NormMode(m)
 	return "Auto"
 end
 -- Phones/tablets only; PC (and touch laptops with a keyboard) keep the normal keyboard.
-local function TouchDevice()
+function TouchDevice()
 	return UserInputService.TouchEnabled == true
 		and UserInputService.KeyboardEnabled ~= true
 		and UserInputService.MouseEnabled ~= true
@@ -3458,7 +3462,7 @@ end
 -- onFocus()/onBlur(enterPressed) fire for both keyboards. Returns focus() for code that
 -- wants to open the box programmatically. extra: {Native = true} always uses the device
 -- keyboard; {Layout = "Numeric"} picks the layout the on-screen keyboard opens with.
-local function AttachKeyboard(box, themeSrc, onFocus, onBlur, extra)
+function AttachKeyboard(box, themeSrc, onFocus, onBlur, extra)
 	extra = extra or {}
 	local native = extra.Native == true
 	local opts = {theme = themeSrc, onFocus = onFocus, onBlur = onBlur, onEnter = extra.OnEnter, Layout = extra.Layout}
@@ -3668,6 +3672,7 @@ Method(Library, "SetKeyboardCompact", function(b)
 end)
 Method(Library, "CloseKeyboard", function() VKB.Close(false) end)
 Method(Library, "ConfigureKeyboard", function(opts) return Keyboard.Configure(opts) end)
+end -- on-screen keyboard
 
 local function AddInput(W, S, o)
 	o = Opts(o)
@@ -3783,6 +3788,8 @@ local function AddInput(W, S, o)
 	return Finish(el, o)
 end
 
+local ParseKey, KeyMatches, SoftPress, BuildKeybindList, AddKeybind
+do -- keybinds
 local KEY_SHORT = {
 	LeftShift = "LShift", RightShift = "RShift", LeftControl = "LCtrl", RightControl = "RCtrl",
 	LeftAlt = "LAlt", RightAlt = "RAlt", MouseButton1 = "MB1", MouseButton2 = "MB2", MouseButton3 = "MB3",
@@ -3804,7 +3811,7 @@ local MOD_KEYS = {
 	Alt = {Enum.KeyCode.LeftAlt, Enum.KeyCode.RightAlt},
 }
 
-local function ParseKey(k)
+function ParseKey(k)
 	if typeof(k) == "EnumItem" then
 		-- Value 0 is the "no key" item (KeyCode.None; older engines called it Unknown).
 		if k.EnumType == Enum.KeyCode and k.Value ~= 0 then return k end
@@ -3819,7 +3826,7 @@ local function ParseKey(k)
 	end
 	return nil
 end
-local function KeyMatches(key, input)
+function KeyMatches(key, input)
 	if not key then return false end
 	if key.EnumType == Enum.KeyCode then return input.KeyCode == key end
 	return input.UserInputType == key
@@ -3912,7 +3919,7 @@ end
 
 -- Click feedback for icon buttons: a short dip in opacity that eases back. No scaling or overshoot.
 local SOFT_TI = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-local function SoftPress(img)
+function SoftPress(img)
 	StopTweens(img)
 	img.ImageTransparency = 0.45
 	Tween(img, SOFT_TI, {ImageTransparency = 0})
@@ -3923,7 +3930,7 @@ local ROW_TI = TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.
 local LIST_TI_IN = TweenInfo.new(0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 local LIST_TI_OUT = TweenInfo.new(0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
 
-local function BuildKeybindList(W, cfg)
+function BuildKeybindList(W, cfg)
 	if cfg == false then cfg = {Visible = false} end
 	if type(cfg) ~= "table" then cfg = {} end
 	local touch = cfg.TouchMode
@@ -4206,7 +4213,7 @@ local function BuildKeybindList(W, cfg)
 	return api
 end
 
-local function AddKeybind(W, S, o)
+function AddKeybind(W, S, o)
 	o = Opts(o)
 	local el, row = NewElement(W, S, "Keybind", o, 25)
 	W.Keybinds = W.Keybinds or {}
@@ -4777,6 +4784,7 @@ local function AddKeybind(W, S, o)
 	Layout(false)
 	return Finish(el, o)
 end
+end -- keybinds
 
 local function AddLabel(W, S, o)
 	if type(o) ~= "table" then o = {Text = o} end
@@ -7060,7 +7068,9 @@ local function BuildConfigs(W, Window)
 	return api
 end
 
-local function GetHwid()
+local GetHwid, Now, FormatDuration, Sha256, KeyBackend, RunKeySystem
+do -- key system
+function GetHwid()
 	if type(gethwid) == "function" then
 		local ok, r = pcall(gethwid)
 		if ok and r then return tostring(r) end
@@ -7094,7 +7104,7 @@ local function BodyIsValid(body)
 	return false
 end
 
-local function Now() return os.time() end
+function Now() return os.time() end
 
 -- Unix seconds; millisecond timestamps are converted.
 local function ParseExpiry(v)
@@ -7104,7 +7114,7 @@ local function ParseExpiry(v)
 	return math.floor(v)
 end
 
-local function FormatDuration(sec)
+function FormatDuration(sec)
 	sec = math.max(0, math.floor(tonumber(sec) or 0))
 	local d = math.floor(sec / 86400)
 	local h = math.floor(sec % 86400 / 3600)
@@ -7117,7 +7127,6 @@ local function FormatDuration(sec)
 end
 
 -- SHA-256, so key lists can ship as hashes instead of plain text and the saved-key file can be signed.
-local Sha256
 do
 	local band, bxor, bnot, rrot, rshift = bit32.band, bit32.bxor, bit32.bnot, bit32.rrotate, bit32.rshift
 	local K = {
@@ -7189,7 +7198,7 @@ local function NormKeySpec(v)
 end
 
 -- Verification + saved-key storage, shared by the first prompt and later re-checks.
-local function KeyBackend(ks, ctx)
+function KeyBackend(ks, ctx)
 	local B = {}
 	local caseSensitive = ks.CaseSensitive ~= false
 
@@ -7387,7 +7396,7 @@ local KEY_TEXTS = {
 
 -- Blocks the calling thread until a key passes verification.
 -- Returns true, {Key, Expires, Activated, Source, Note, Hwid}, or false if the user closes it.
-local function RunKeySystem(ks, ctx)
+function RunKeySystem(ks, ctx)
 	if type(ks) ~= "table" then ks = {} end
 	if ks.Enabled == false then return true, {} end
 	ctx = ctx or {}
@@ -7703,6 +7712,7 @@ local function RunKeySystem(ks, ctx)
 	end
 	return coroutine.yield()
 end
+end -- key system
 
 local function CreateWindow(o)
 	o = Opts(o)
