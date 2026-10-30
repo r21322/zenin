@@ -750,25 +750,25 @@ end
 -- Soft accent wash on the left edge of a header. A UIGradient is baked into a small texture, so a
 -- ramp squeezed into the first ~16% of a full-width header renders blocky; giving the ramp its own
 -- narrow frame uses the gradient's full range. Returns a repaint function(accent, alpha).
-local WASH_FADE = NumberSequence.new({
-	NumberSequenceKeypoint.new(0, 0),
-	NumberSequenceKeypoint.new(0.25, 0.44),
-	NumberSequenceKeypoint.new(0.5, 0.75),
-	NumberSequenceKeypoint.new(0.75, 0.94),
-	NumberSequenceKeypoint.new(1, 1),
-})
+local WASH_FADE = NumberSequence.new(0, 1)
 local function AccentWash(header, radius, strength, width)
-	-- Same ZIndex as its siblings: it must sit above the header's corner fill (created before it)
-	-- and below the brand/title (created after it).
-	local wash = Create("Frame", {Size = UDim2.new(0, width or 80, 1, 0), BorderSizePixel = 0, Parent = header})
+	-- One layer only, so the tint is uniform top to bottom. The frame is taller than the header by
+	-- the corner radius and clipped back: the top-left corner matches the header's rounding, the
+	-- bottom corners are cut square where the header continues into the body.
+	-- Same ZIndex as its siblings: above the header's corner fill (created before it), below the
+	-- brand/title (created after it).
+	local clip = Create("Frame", {
+		Size = UDim2.new(0, width or 96, 1, 0),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		Parent = header,
+	})
+	local wash = Create("Frame", {Size = UDim2.new(1, 0, 1, radius), BorderSizePixel = 0, Parent = clip})
 	Corner(wash, radius)
-	local fill = Create("Frame", {Size = UDim2.new(1, 0, 0.5, 0), Position = UDim2.fromScale(0, 0.5), BorderSizePixel = 0, Parent = wash})
 	Create("UIGradient", {Transparency = WASH_FADE, Parent = wash})
-	Create("UIGradient", {Transparency = WASH_FADE, Parent = fill})
 	return function(accent, alpha)
-		local t = 1 - strength * (alpha or 1)
-		wash.BackgroundColor3, fill.BackgroundColor3 = accent, accent
-		wash.BackgroundTransparency, fill.BackgroundTransparency = t, t
+		wash.BackgroundColor3 = accent
+		wash.BackgroundTransparency = 1 - strength * (alpha or 1)
 	end
 end
 
