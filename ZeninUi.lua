@@ -6184,13 +6184,18 @@ local function BuildNavigation(W)
 		return 0
 	end
 
+	-- Page switch: a soft dissolve rather than a jump. The outgoing page eases a few pixels back
+	-- while the veil (W.Fader) eases in; under the veil the pages swap, then the new page drifts
+	-- the last few pixels into place as the veil lifts. The reveal is slightly delayed and slower
+	-- than the drift, so the motion is already settling by the time the content is visible.
 	local PageTweens = {}
 	local SwitchToken = 0
-	local SLIDE = 18
-	local TI_OUT = TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-	local TI_MOVE = TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-	local TI_FADE = TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+	local DRIFT_OUT, DRIFT_IN = 6, 10
+	local TI_OUT = TweenInfo.new(0.14, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+	local TI_MOVE = TweenInfo.new(0.36, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+	local TI_REVEAL = TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out, 0, false, 0.05)
 	local HOME = UDim2.fromOffset(0, HEADER_H)
+	local function Offset(x) return UDim2.fromOffset(x, HEADER_H) end
 	function W.ShowPage(page, animate)
 		SwitchToken = SwitchToken + 1
 		local token = SwitchToken
@@ -6209,10 +6214,10 @@ local function BuildNavigation(W)
 			page.ScrollTo(0, true)
 			page.Show(true)
 			if animate then
-				page.scroll.Position = UDim2.fromOffset(dir * SLIDE, HEADER_H)
+				page.scroll.Position = Offset(dir * DRIFT_IN)
 				W.Fader.BackgroundTransparency = 0
 				table.insert(PageTweens, Tween(page.scroll, TI_MOVE, {Position = HOME}))
-				table.insert(PageTweens, Tween(W.Fader, TI_FADE, {BackgroundTransparency = 1}))
+				table.insert(PageTweens, Tween(W.Fader, TI_REVEAL, {BackgroundTransparency = 1}))
 			else
 				page.scroll.Position = HOME
 				W.Fader.BackgroundTransparency = 1
@@ -6223,7 +6228,7 @@ local function BuildNavigation(W)
 			Swap()
 			return
 		end
-		table.insert(PageTweens, Tween(old.scroll, TI_OUT, {Position = UDim2.fromOffset(-dir * SLIDE * 0.5, HEADER_H)}))
+		table.insert(PageTweens, Tween(old.scroll, TI_OUT, {Position = Offset(-dir * DRIFT_OUT)}))
 		local out = TweenService:Create(W.Fader, TI_OUT, {BackgroundTransparency = 0})
 		table.insert(PageTweens, out)
 		out.Completed:Connect(function(state)
