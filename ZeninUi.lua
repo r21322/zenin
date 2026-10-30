@@ -3806,7 +3806,8 @@ local MOD_KEYS = {
 
 local function ParseKey(k)
 	if typeof(k) == "EnumItem" then
-		if k.EnumType == Enum.KeyCode and k ~= Enum.KeyCode.Unknown then return k end
+		-- Value 0 is the "no key" item (KeyCode.None; older engines called it Unknown).
+		if k.EnumType == Enum.KeyCode and k.Value ~= 0 then return k end
 		if k == Enum.UserInputType.MouseButton1 or k == Enum.UserInputType.MouseButton2 or k == Enum.UserInputType.MouseButton3 then return k end
 		return nil
 	end
@@ -4623,7 +4624,7 @@ local function AddKeybind(W, S, o)
 					StopPicking()
 				elseif kc == Enum.KeyCode.Backspace or kc == Enum.KeyCode.Delete then
 					SetBind(nil, nil)
-				elseif kc == Enum.KeyCode.Unknown then
+				elseif kc.Value == 0 then
 					return
 				elseif MOD_GROUP[kc.Name] then
 					pendingMod = kc
